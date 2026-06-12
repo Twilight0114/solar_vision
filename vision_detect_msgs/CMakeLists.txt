@@ -16,6 +16,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/VisionLocalization.msg"
   "msg/HeadingError.msg"
   "msg/EdgeObservation.msg"
+  "msg/VisionStatus.msg"
   DEPENDENCIES std_msgs
 )
 # uncomment the following section in order to fill in
