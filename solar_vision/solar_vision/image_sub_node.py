@@ -5,7 +5,8 @@ from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import math
-from vision_detect_msgs.msg import VisionLocalization, HeadingError, EdgeObservation
+import traceback
+from vision_detect_msgs.msg import VisionLocalization, HeadingError, EdgeObservation, VisionStatus
 
 # ==============================================================
 # 将你的算法类稍微改造一下，使其适应实时视频流输入
@@ -136,6 +137,7 @@ class PVLineDetector:
     
     def detect_line_crossing(self, blurred_gray, lines, output_img):
         height, width = output_img.shape[:2]
+        cx = int(width / 2) # 画面的中心 X
         self.tripwire_y = int(height / 2)
         self.trigger_zone = 5 
         
@@ -145,83 +147,100 @@ class PVLineDetector:
             return 0
             
         cross_event = 0
-        horizontal_y_list = []
+        raw_lines = []
         
+        # 1. 提取所有横向为主的线，并计算它们在画面正中央的 Y 坐标和斜率 K
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            if abs(x2 - x1) > abs(y2 - y1):
-                horizontal_y_list.append((y1 + y2) / 2)
+            dx = abs(x2 - x1)
+            dy = abs(y2 - y1)
+            
+            if dx > dy: 
+                if x1 == x2: continue
+                k = (y2 - y1) / (x2 - x1) # 计算斜率
+                b = y1 - k * x1
+                y_center = k * cx + b     # 计算该直线延长线与画面中轴线的交点
+                raw_lines.append((y_center, k))
 
-        horizontal_y_list.sort()
-        merged_y_list = []
-        for y in horizontal_y_list:
-            if not merged_y_list or abs(y - merged_y_list[-1]) > 40:
-                merged_y_list.append(y)
+        # 2. 聚类：把同一根线上的碎段合并
+        raw_lines.sort(key=lambda item: item[0])
+        merged_lines = []
+        for y_c, k in raw_lines:
+            if not merged_lines or abs(y_c - merged_lines[-1][0]) > 40:
+                merged_lines.append([y_c, k, 1]) # [当前平均 y_center, sum_k, count]
             else:
-                merged_y_list[-1] = (merged_y_list[-1] + y) / 2
+                count = merged_lines[-1][2] + 1
+                merged_lines[-1][0] = (merged_lines[-1][0] * merged_lines[-1][2] + y_c) / count
+                merged_lines[-1][1] += k
+                merged_lines[-1][2] = count
 
-        # 对比度 + 厚度双重安检，过滤掉那些无关的弱纹理和粗壮白边，只留下真正的格子线
-
-        valid_y_list = []
-        for y in merged_y_list:
-            y_int = int(y)
-            y_start = max(0, y_int - 20)
-            y_end = min(height, y_int + 20)
+        # ==========================================
+        # 3. 核心升级：倾斜自适应 CT 扫描 (Rotated Scan)
+        # ==========================================
+        valid_y_centers = []
+        
+        # 锁定 X 采样范围 (中心 ±50)
+        sample_xs = np.arange(max(0, cx - 50), min(width, cx + 50))
+        
+        for m in merged_lines:
+            y_center = m[0]
+            k = m[1] / m[2] # 提取平均斜率
+            y_int = int(y_center)
             
-            # 【修复 1】扩大扫描宽度：从中间切取 100 个像素宽，求平均，彻底抹平噪点
-            mid_x = int(width / 2)
-            slice_roi = np.mean(blurred_gray[y_start:y_end, max(0, mid_x-50):min(width, mid_x+50)], axis=1)
-            
+            slice_roi = []
+            # 在垂直方向上以 offset 为偏移量进行平移扫描 (上下 20 像素)
+            for offset in range(-20, 21):
+                # 【神来之笔】：让采样线和光伏板格子拥有完全相同的倾斜角度！
+                sample_ys = np.clip(np.int32(k * (sample_xs - cx) + y_center + offset), 0, height - 1)
+                mean_val = np.mean(blurred_gray[sample_ys, sample_xs])
+                slice_roi.append(mean_val)
+                
+            slice_roi = np.array(slice_roi)
             local_max = np.max(slice_roi)
             local_min = np.min(slice_roi)
             contrast = local_max - local_min
             
-            # ----------------------------------------
-            # 安检门 1：对比度过滤（专杀图一的无关弱纹理）
-            # 如果对比度太低，说明它根本不是带有高亮焊点的粗格子
-            # ----------------------------------------
+            # 计算这条线的左右端点，用于在画面上画出完美的倾斜线
+            left_y = int(k * (0 - cx) + y_center)
+            right_y = int(k * (width - cx) + y_center)
+            
+            # 安检门 1：对比度过滤
             if contrast < 40: 
-                # 用细红线画出，并打印它那可怜的对比度
-                cv2.line(output_img, (0, y_int), (width, y_int), (0, 0, 255), 1)
-                cv2.putText(output_img, f"WEAK ({int(contrast)})", (10, y_int-10), 
+                cv2.line(output_img, (0, left_y), (width, right_y), (0, 0, 255), 1)
+                cv2.putText(output_img, f"WEAK ({int(contrast)})", (cx + 60, y_int), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                continue # 【关键修复：拒绝放行，直接检查下一根】
+                continue 
                 
-            # ----------------------------------------
-            # 安检门 2：厚度过滤（专杀图二的粗壮白边）
-            # ----------------------------------------
+            # 安检门 2：厚度过滤 (收严至 15，强力杀灭小板边缘)
             threshold = local_min + contrast * 0.5
             thickness = np.sum(slice_roi > threshold)
             
-            if thickness >= 15:
-                # 用粉色画出，并打印厚度
-                cv2.line(output_img, (0, y_int), (width, y_int), (255, 0, 255), 2)
-                cv2.putText(output_img, f"THICK ({thickness})", (10, y_int-10), 
+            if thickness >= 15: 
+                cv2.line(output_img, (0, left_y), (width, right_y), (255, 0, 255), 2)
+                cv2.putText(output_img, f"THICK ({thickness})", (cx + 60, y_int), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-                continue # 【关键修复：拒绝放行，直接检查下一根】
+                continue 
                 
-            # ----------------------------------------
-            # 恭喜，通过双重安检，这是完美的格子！
-            # ----------------------------------------
-            valid_y_list.append(y)
-            cv2.line(output_img, (0, y_int), (width, y_int), (255, 255, 0), 2)
+            # 完美格子
+            valid_y_centers.append(y_center)
+            cv2.line(output_img, (0, left_y), (width, right_y), (255, 255, 0), 2)
 
-        # 寻找最近的有效格子并触发状态机
+        # 4. 寻找距离绊线最近的有效格子并触发状态机
         min_dist = 9999
-        closest_horizontal_y = -1
-        for y in valid_y_list:
-            dist = abs(y - self.tripwire_y)
+        closest_y_center = -1
+        for y_c in valid_y_centers:
+            dist = abs(y_c - self.tripwire_y)
             if dist < min_dist:
                 min_dist = dist
-                closest_horizontal_y = y
+                closest_y_center = y_c
 
-        if closest_horizontal_y != -1 and min_dist <= self.trigger_zone:
+        if closest_y_center != -1 and min_dist <= self.trigger_zone:
             if not self.line_is_crossing:
                 cross_event = 1
                 self.line_is_crossing = True
-                cv2.circle(output_img, (int(width/2), int(closest_horizontal_y)), 20, (0, 255, 0), -1)
+                cv2.circle(output_img, (cx, int(closest_y_center)), 20, (0, 255, 0), -1)
         else:
-            if closest_horizontal_y == -1 or min_dist > 20:
+            if closest_y_center == -1 or min_dist > 20:
                 self.line_is_crossing = False
             
         return cross_event
@@ -368,40 +387,72 @@ class VisionDetectNode(Node):
         super().__init__('vision_detect_node')
         
         self.bridge = CvBridge()
-        
-        # 实例化你的核心算法类！
         self.line_detector = PVLineDetector()
 
         # 核心状态机变量
-        self.current_state = "NORMAL"
+        self.current_state = "NORMAL" #测试默认NORMAL，实际初始为 FAULT，等待 planner 唤醒
         self.block_id = 0
         self.cell_row = -1
         self.cell_col = -1
         self.inner_row = -1
         self.inner_col = -1
 
-        # 订阅相机图像
-        #self.sub_image = self.create_subscription(
-            #Image, '/camera/image_raw', self.image_callback, 10)
+        #测试用的视频路径，实际部署时改为摄像头订阅
         self.video_path = '/home/cat/ros2_ws/testvideo/1.mp4' 
         self.cap = cv2.VideoCapture(self.video_path)
-        
         if not self.cap.isOpened():
             self.get_logger().error(f"严重错误：无法打开视频文件 {self.video_path}！")
         else:
-            self.get_logger().info(f"成功加载视频文件：{self.video_path}")
-            
-        # 创建一个定时器，模拟 30fps 的视频流 (约 0.033 秒触发一次)
-        self.timer_video = self.create_timer(0.033, self.video_loop_callback)
+            self.get_logger().info(f"成功加载视频文件：{self.video_path}") 
 
-        # 发布者
+        #实际实验中，把上面的视频循环定时器替换成下面的 ROS 订阅回调函数，接收来自摄像头的实时图像流：
+        # # --- 运行上下文 ---
+        # self.travel_axis = "block_u"
+        # self.travel_sign = 1
+
+        # # ================== 1. 订阅 Topic ==================
+        # self.sub_image = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
+        # self.sub_cam_info = self.create_subscription(CameraInfo, '/camera/camera_info', self.cam_info_callback, 10)
+        # self.sub_init = self.create_subscription(VisionInit, '/mission_planner/vision_init', self.init_callback, 10)
+        # self.sub_ctx = self.create_subscription(TravelContext, '/mission_planner/travel_context', self.context_callback, 10)
+        
+        # # ================== 2. 发布 Topic ==================
         self.pub_localization = self.create_publisher(VisionLocalization, '/vision/localization', 10)
         self.pub_heading_error = self.create_publisher(HeadingError, '/vision/heading_error', 10)
         self.pub_edge_obs = self.create_publisher(EdgeObservation, '/vision/edge_observation', 10)
-    
+        self.pub_status = self.create_publisher(VisionStatus, '/vision/status', 10)
+        self.pub_debug = self.create_publisher(Image, '/vision/debug_image', 10)
+        
+        # # 周期性发布状态和定位
+        # self.create_timer(0.1, self.timer_publish_loc_and_status)
+        
+        # 创建一个定时器，模拟 30fps 的视频流 (约 0.033 秒触发一次)
+        self.timer_video = self.create_timer(0.033, self.video_loop_callback)
         self.timer_publish_loc = self.create_timer(0.1, self.publish_localization)
-        self.get_logger().info('视觉感知节点已启动，正在应用 OpenCV 传统视觉算法...')
+        self.get_logger().info('视觉感知节点已启动，视频模式测试中...')
 
+# ---------------- 业务回调处理 ----------------
+    def init_callback(self, msg):
+        self.block_id = msg.block_id
+        self.cell_row = msg.cell_row
+        self.cell_col = msg.cell_col
+        self.inner_row = msg.inner_row
+        self.inner_col = msg.inner_col
+        self.current_state = "NORMAL"
+        self.get_logger().info(f"收到初始化: block={self.block_id}, inner=[{self.inner_row}, {self.inner_col}]")
+
+    def context_callback(self, msg):
+        self.travel_axis = msg.travel_axis
+        self.travel_sign = msg.travel_sign
+
+    def cam_info_callback(self, msg):
+        # 动态更新内参用于距离计算
+        self.line_detector.fx = msg.k[0]
+        self.line_detector.cx = msg.k[2]
+        self.line_detector.fy = msg.k[4]
+        self.line_detector.cy = msg.k[5]
+        
+            
     def video_loop_callback(self):
             """
             定时器触发，每次从视频文件中抠出一帧进行处理
@@ -465,52 +516,73 @@ class VisionDetectNode(Node):
                 cv2.waitKey(1)
                         
             except Exception as e:
-                self.get_logger().error(f'视频帧处理失败: {e}')
+                self.get_logger().error(f'视频帧处理失败:\n{traceback.format_exc()}')
 
     # def image_callback(self, msg):
-    #     try:
-    #         # 1. 获取实时图像
-    #         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+    #     if self.current_state == "FAULT":
+    #         return # 没被初始化，不浪费算力
             
-    #         # 2. 将图像送入你的流水线进行处理
-    #         result_img, edges_img, heading_error_rad, cross_event, edge_info = self.line_detector.process_frame(cv_image)
-    #         # 解包边缘信息
-    #         edge_visible, edge_type, safety_level = edge_info
-            
-    #         # ==========================================
-    #         # 组装并发布 EdgeObservation 消息
-    #         # ==========================================
-    #         msg_edge = EdgeObservation()
-    #         msg_edge.edge_visible = edge_visible
-    #         msg_edge.edge_side = "front" # 简化的摄像头默认在前方
-    #         msg_edge.d_edge_cm = -1.0    # C++阶段可以通过相机内参算真实距离，目前用-1代替
-    #         msg_edge.edge_type = edge_type
-    #         msg_edge.safety_level = safety_level
+    #     cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+    #     result_img, edges_img, heading_error, cross_event, edge_info = self.line_detector.process_frame(cv_image)
+        
+    #     # ==========================================
+    #     # 核心逻辑：结合上下文进行状态机运转
+    #     # ==========================================
+    #     # 1. 处理过内部格子事件
+    #     if cross_event == 1:
+    #         if self.travel_axis == "block_u":
+    #             self.inner_col += self.travel_sign
+    #         else:
+    #             self.inner_row += self.travel_sign
+                
+    #     # 2. 处理跨越小板边界 (Cell Edge) 事件
+    #     edge_visible, edge_type, safety_level, d_edge_cm = edge_info
+    #     if edge_visible and edge_type == self.line_detector.EDGE_TYPES["GAP"]:
+    #         # 当跨过缝隙时，根据方向更新 cell_row / cell_col
+    #         # 并重置 inner_row / inner_col 
+    #         pass # (具体逻辑需要对照 grid_localization.md 的细节)
 
-    #         self.pub_edge_obs.publish(msg_edge)
-    #         # ==========================================
-    #         # 结合 travel_context 更新内部格子状态！
-    #         # ==========================================
-    #         # 假设机器人已经初始化，且当前沿着 block_u 轴以 +1 方向清扫
-    #         if self.current_state != "FAULT" and cross_event == 1:
-    #             self.get_logger().info('>>> 触发过线事件！')
+    #     # 3. 发布 EdgeObservation 和 HeadingError (代码略，和你之前写的一样)
+    #     result_img, edges_img, heading_error_rad, cross_event, edge_info = self.line_detector.process_frame(cv_image)
                 
-    #             # 这里就是严格执行 grid_localization.md 中的逻辑
-    #             # 假定 travel_axis 为 'block_u', travel_sign 为 +1
-    #             self.inner_col += 1
+    #             # ==========================================
+    #             # 2. 在这里组装并发布 EdgeObservation 消息！
+    #             # ==========================================
+    #             # 解包刚收到的边缘信息（注意现在是 4 个参数了，多了物理距离 d_edge_cm）
+    #     edge_visible, edge_type, safety_level, d_edge_cm = edge_info
                 
-    #             #TODO: 跨过这块小板后的越界处理（留给小板边缘检测来做）
-            
-    #         # 3. 实时显示结果 (不要用 plt.show，用 cv2.imshow)
-    #         # 开两个窗口，一个看最终的线，一个看底层的二值化边缘，这对调参非常有帮助！
-    #         cv2.imshow("Detected Lines", result_img)
-    #         cv2.imshow("Binary Edges", edges_img)
-    #         cv2.waitKey(1)
-            
-    #     except Exception as e:
-    #         self.get_logger().error(f'图像处理失败: {e}')
+    #     msg_edge = EdgeObservation()
+    #     msg_edge.edge_visible = edge_visible
+    #     msg_edge.edge_side = "front"
+    #     msg_edge.d_edge_cm = float(d_edge_cm)  # 赋予物理厘米数
+    #     msg_edge.edge_type = edge_type
+    #     msg_edge.safety_level = safety_level
+                
+    #     # 用节点类 (VisionDetectNode) 的发布者发布消息！
+    #     self.pub_edge_obs.publish(msg_edge)
+        
+    #     # ==========================================
+    #     # 3. 组装并发布 HeadingError 消息
+    #     # ==========================================
+    #     heading_msg = HeadingError()
+    #     heading_msg.header.stamp = self.get_clock().now().to_msg()
+    #     heading_msg.header.frame_id = "body"
+    #     if heading_error_rad is not None:
+    #         heading_msg.valid = True
+    #         heading_msg.heading_error_rad = float(heading_error_rad)
+    #     else:
+    #         heading_msg.valid = False
+    #         heading_msg.heading_error_rad = 0.0
+    #     self.pub_heading_error.publish(heading_msg)
+                
+    #     # 4. 发布 Debug 图像
+    #     debug_msg = self.bridge.cv2_to_imgmsg(result_img, encoding="bgr8")
+    #     self.pub_debug.publish(debug_msg)
 
     def publish_localization(self):
+        # ==========================================
+        # 1. 发布 Localization 消息
+        # ==========================================
         msg = VisionLocalization()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "pv_map"
@@ -521,6 +593,20 @@ class VisionDetectNode(Node):
         msg.inner_row = self.inner_row
         msg.inner_col = self.inner_col
         self.pub_localization.publish(msg)
+
+        # ==========================================
+        # 2. 发布 VisionStatus 消息
+        # ==========================================
+        status_msg = VisionStatus()
+        status_msg.state = self.current_state
+        
+        # 动态判定相机是否正常：如果在测视频，看 cap 是否打开；如果在真实小车上，看是否持续收到图像
+        if hasattr(self, 'cap'):
+            status_msg.camera_ok = self.cap.isOpened()
+        else:
+            status_msg.camera_ok = True # 如果改为真实相机订阅，这里可以加上更严谨的超时检测
+            
+        self.pub_status.publish(status_msg)
 
 def main(args=None):
     rclpy.init(args=args)
