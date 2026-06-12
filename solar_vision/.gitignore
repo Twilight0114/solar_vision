@@ -1,0 +1,14 @@
+# 忽略编译产生的文件和目录
+build/
+install/
+log/
+*.o
+*.so
+*.a
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+
+# 忽略 VS Code 配置
+.vscode/
