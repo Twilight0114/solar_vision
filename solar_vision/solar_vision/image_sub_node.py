@@ -6,11 +6,10 @@ import cv2
 import numpy as np
 import math
 import traceback
+#from rover_fcu_bridge.msg import RoverStatus
 from vision_detect_msgs.msg import VisionLocalization, HeadingError, EdgeObservation, VisionStatus
 
-# ==============================================================
-# 将你的算法类稍微改造一下，使其适应实时视频流输入
-# ==============================================================
+
 class PVLineDetector:
     def __init__(self):
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -19,7 +18,7 @@ class PVLineDetector:
         self.line_is_crossing = False
         
         # ==========================================
-        # 新增：相机物理参数与状态枚举定义
+        # 机物理参数与状态枚举定义
         # ==========================================
         # 1. 物理安装参数 (你需要根据小车实际情况测量修改)
         self.camera_height_cm = 15.0  # 相机距离光伏板面的高度 (cm)
@@ -31,12 +30,10 @@ class PVLineDetector:
         self.cx = 320.0  # 图像中心 X
         self.cy = 240.0  # 图像中心 Y
         
-        # 3. 严格映射 API.md 的枚举字典
+        # 3. 严格映射 
         self.EDGE_TYPES = {
-            "FRONT": "block_edge_front",
-            "LEFT": "block_edge_left",
-            "RIGHT": "block_edge_right",
-            "GAP": "cell_edge"
+            "BLOCK": "block_edge", # 大板悬崖
+            "CELL": "cell_edge"    # 小板缝隙
         }
         self.SAFETY_LEVELS = {
             "STOP": "EDGE_STOP",
@@ -190,7 +187,7 @@ class PVLineDetector:
             slice_roi = []
             # 在垂直方向上以 offset 为偏移量进行平移扫描 (上下 20 像素)
             for offset in range(-20, 21):
-                # 【神来之笔】：让采样线和光伏板格子拥有完全相同的倾斜角度！
+                # 让采样线和光伏板格子拥有完全相同的倾斜角度
                 sample_ys = np.clip(np.int32(k * (sample_xs - cx) + y_center + offset), 0, height - 1)
                 mean_val = np.mean(blurred_gray[sample_ys, sample_xs])
                 slice_roi.append(mean_val)
@@ -333,59 +330,69 @@ class PVLineDetector:
                     if max(x1, x2) > right_margin:
                         lines_on_right += 1
 
-        # ==========================================
+       # ==========================================
         # 1. 悬崖判定与【动态物理测距】
         # ==========================================
         if lines_in_front == 0:
-            # 此时的物理边缘，就是画面里那根最靠上的线 (min_y_front)！
             if min_y_front == height:
-                d_edge_cm = 0.0 # 画面里没线了，说明已经开出去了
+                d_edge_cm = 0.0
             else:
                 d_edge_cm = self.pixel_to_distance_cm(min_y_front, axis='y')
-                
             cv2.putText(output_img, f"FRONT CLIFF! Dist: {d_edge_cm}cm", (int(width/2)-150, lookahead_y - 20), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            return True, self.EDGE_TYPES["FRONT"], self.SAFETY_LEVELS["STOP"], d_edge_cm
+            # 【修改点】：返回 BLOCK 类型，以及方向 "front"
+            return True, self.EDGE_TYPES["BLOCK"], "front", self.SAFETY_LEVELS["STOP"], d_edge_cm
 
         if lines_on_right == 0:
-            # 追踪最右侧那根线的 X 坐标
             edge_x = max_x_right if max_x_right > 0 else right_margin
             d_edge_cm = self.pixel_to_distance_cm(edge_x, axis='x')
             cv2.putText(output_img, f"RIGHT CLIFF ({d_edge_cm}cm)", (right_margin - 220, int(height/2)), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            return True, self.EDGE_TYPES["RIGHT"], self.SAFETY_LEVELS["STOP"], d_edge_cm
+            # 【修改点】：返回 BLOCK 类型，以及方向 "right"
+            return True, self.EDGE_TYPES["BLOCK"], "right", self.SAFETY_LEVELS["STOP"], d_edge_cm
             
         if lines_on_left == 0:
-            # 追踪最左侧那根线的 X 坐标
             edge_x = min_x_left if min_x_left < width else left_margin
             d_edge_cm = self.pixel_to_distance_cm(edge_x, axis='x')
             cv2.putText(output_img, f"LEFT CLIFF ({d_edge_cm}cm)", (left_margin + 20, int(height/2)), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            return True, self.EDGE_TYPES["LEFT"], self.SAFETY_LEVELS["STOP"], d_edge_cm
+            # 【修改点】：返回 BLOCK 类型，以及方向 "left"
+            return True, self.EDGE_TYPES["BLOCK"], "left", self.SAFETY_LEVELS["STOP"], d_edge_cm
 
         # ==========================================
-        # 2. 小板缝隙测距（横移时动态改变）
+        # 2. 小板缝隙测距
         # ==========================================
         col_means = np.mean(blurred_gray, axis=0)
         max_mean_val = np.max(col_means)
         max_mean_x = int(np.argmax(col_means))
 
         if max_mean_val > 180:  
-            # 小车的摄像头往左往右偏时，max_mean_x 会跟着变，距离也会变！
             d_edge_cm = self.pixel_to_distance_cm(max_mean_x, axis='x')
             cv2.line(output_img, (max_mean_x, 0), (max_mean_x, height), (255, 0, 255), 3)
             cv2.putText(output_img, f"CELL EDGE ({d_edge_cm}cm)", (max_mean_x + 10, int(height/2)), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-            return True, self.EDGE_TYPES["GAP"], self.SAFETY_LEVELS["WARN"], d_edge_cm
+            # 【修改点】：返回 CELL 类型，方向留空 ""
+            return True, self.EDGE_TYPES["CELL"], "", self.SAFETY_LEVELS["WARN"], d_edge_cm
 
-        return edge_visible, edge_type, safety_level, d_edge_cm
+        return edge_visible, edge_type, "", safety_level, d_edge_cm
 
 
 
 class VisionDetectNode(Node):
     def __init__(self):
         super().__init__('vision_detect_node')
-        
+        # 声明 API 要求的节点参数
+        self.declare_parameter('camera_to_base_x_cm', 0.0)
+        self.declare_parameter('camera_to_base_y_cm', 0.0)
+        self.declare_parameter('camera_yaw_offset_rad', 0.0)
+        self.declare_parameter('vision_timeout_ms', 1000)
+
+        # 可以在这里读取并在后续计算物理距离时作为偏移量补偿（目前先挂载，防止 launch 报错）
+        self.cam_offset_x = self.get_parameter('camera_to_base_x_cm').value
+        self.cam_offset_y = self.get_parameter('camera_to_base_y_cm').value
+        self.cam_yaw_offset = self.get_parameter('camera_yaw_offset_rad').value
+        self.vision_timeout = self.get_parameter('vision_timeout_ms').value
+
         self.bridge = CvBridge()
         self.line_detector = PVLineDetector()
 
@@ -405,16 +412,27 @@ class VisionDetectNode(Node):
         else:
             self.get_logger().info(f"成功加载视频文件：{self.video_path}") 
 
-        #实际实验中，把上面的视频循环定时器替换成下面的 ROS 订阅回调函数，接收来自摄像头的实时图像流：
-        # # --- 运行上下文 ---
-        # self.travel_axis = "block_u"
-        # self.travel_sign = 1
+        # --- 运行上下文 ---
+        self.travel_axis = "block_u"
+        self.travel_sign = 1
+        #  声明并获取参数
+        self.declare_parameter('camera_topic', '/camera/image_raw')
+        self.declare_parameter('camera_info_topic', '/camera/camera_info')
+        self.declare_parameter('publish_debug_image', False) # 默认关闭调试图节省算力
+        
+        cam_topic = self.get_parameter('camera_topic').value
+        info_topic = self.get_parameter('camera_info_topic').value
+        self.enable_debug = self.get_parameter('publish_debug_image').value
 
         # # ================== 1. 订阅 Topic ==================
         # self.sub_image = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
         # self.sub_cam_info = self.create_subscription(CameraInfo, '/camera/camera_info', self.cam_info_callback, 10)
         # self.sub_init = self.create_subscription(VisionInit, '/mission_planner/vision_init', self.init_callback, 10)
         # self.sub_ctx = self.create_subscription(TravelContext, '/mission_planner/travel_context', self.context_callback, 10)
+        
+        # 订阅 FCU 状态
+        # self.sub_fcu = self.create_subscription(RoverStatus, '/fcu/status', self.fcu_callback, 10)
+        # self.current_fcu_speed = 0.0
         
         # # ================== 2. 发布 Topic ==================
         self.pub_localization = self.create_publisher(VisionLocalization, '/vision/localization', 10)
@@ -430,6 +448,10 @@ class VisionDetectNode(Node):
         self.timer_video = self.create_timer(0.033, self.video_loop_callback)
         self.timer_publish_loc = self.create_timer(0.1, self.publish_localization)
         self.get_logger().info('视觉感知节点已启动，视频模式测试中...')
+
+    def fcu_callback(self, msg):
+        # 记录当前车体真实速度 (m/s)
+        self.current_fcu_speed = msg.linear_velocity_mps
 
 # ---------------- 业务回调处理 ----------------
     def init_callback(self, msg):
@@ -470,49 +492,65 @@ class VisionDetectNode(Node):
                 return
 
             try:
-                # 1. 把图像喂给“大脑”，接住返回的 5 个数据
+                # 1. 喂给大脑，注意这里还是接住 5 个返回值
                 result_img, edges_img, heading_error_rad, cross_event, edge_info = self.line_detector.process_frame(cv_image)
                 
                 # ==========================================
-                # 2. 在这里组装并发布 EdgeObservation 消息！
+                # 2. 解包边缘信息 (现在里面有 5 个元素了！)
                 # ==========================================
-                # 解包刚收到的边缘信息（注意现在是 4 个参数了，多了物理距离 d_edge_cm）
-                edge_visible, edge_type, safety_level, d_edge_cm = edge_info
+                edge_visible, edge_type, edge_side_val, safety_level, d_edge_cm = edge_info
                 
                 msg_edge = EdgeObservation()
                 msg_edge.edge_visible = edge_visible
-                msg_edge.edge_side = "front"
-                msg_edge.d_edge_cm = float(d_edge_cm)  # 赋予物理厘米数
+                msg_edge.edge_side = edge_side_val if edge_visible else "" # 动态赋予方向
+                # 将“相机距离”转换为“车体距离”
+                if d_edge_cm >= 0:
+                    msg_edge.d_edge_cm = float(d_edge_cm + self.cam_offset_x)
+                else:
+                    msg_edge.d_edge_cm = -1.0  
                 msg_edge.edge_type = edge_type
                 msg_edge.safety_level = safety_level
-                
-                # 用节点类 (VisionDetectNode) 的发布者发布消息！
                 self.pub_edge_obs.publish(msg_edge)
                 
                 # ==========================================
-                # 3. 组装并发布 HeadingError 消息
+                # 3. 跨越边界与格子计数状态机 (整合上下文)
+                # ==========================================
+                if self.current_state != "FAULT":
+                    # A. 跨越内部格子
+                    if cross_event == 1:
+                        self.get_logger().info(f'>>> 触发过线事件！(方向: {self.travel_sign})')
+                        if self.travel_axis == "block_u":
+                            self.inner_col += self.travel_sign
+                        else:
+                            self.inner_row += self.travel_sign
+
+                    # B. 跨越小板缝隙 (Cell Edge)
+                    if edge_visible and edge_type == self.line_detector.EDGE_TYPES["CELL"]:
+                        self.get_logger().warn('>>> 跨越小板边界！')
+                        if self.travel_axis == "block_u":
+                            self.cell_col += self.travel_sign
+                            self.inner_col = 0 if self.travel_sign == 1 else 99 # 跨板后重置内部格子
+                        else:
+                            self.cell_row += self.travel_sign
+                            self.inner_row = 0 if self.travel_sign == 1 else 99
+                
+                # ==========================================
+                # 4. 发布 HeadingError 消息 (结合行车方向翻转符号)
                 # ==========================================
                 heading_msg = HeadingError()
                 heading_msg.header.stamp = self.get_clock().now().to_msg()
                 heading_msg.header.frame_id = "body"
                 if heading_error_rad is not None:
                     heading_msg.valid = True
-                    heading_msg.heading_error_rad = float(heading_error_rad)
+                    # 【核心修正】：如果倒着走，航向误差必须乘上 travel_sign 翻转过来！
+                    heading_msg.heading_error_rad = float(heading_error_rad * self.travel_sign)
                 else:
                     heading_msg.valid = False
                     heading_msg.heading_error_rad = 0.0
                 self.pub_heading_error.publish(heading_msg)
                 
-                # ==========================================
-                # 4. 打印过线事件，维护状态机
-                # ==========================================
-                if self.current_state != "FAULT" and cross_event == 1:
-                    self.get_logger().info('>>> 触发过线事件！(内部格子计数 +1)')
-                    self.inner_col += 1
-                
                 # 显示结果
                 cv2.imshow("Detected Lines & Yaw", result_img)
-                # cv2.imshow("Binary Edges", edges_img) # 看情况开这个窗口
                 cv2.waitKey(1)
                         
             except Exception as e:
@@ -554,7 +592,10 @@ class VisionDetectNode(Node):
     #     msg_edge = EdgeObservation()
     #     msg_edge.edge_visible = edge_visible
     #     msg_edge.edge_side = "front"
-    #     msg_edge.d_edge_cm = float(d_edge_cm)  # 赋予物理厘米数
+    #     if d_edge_cm >= 0:
+            # msg_edge.d_edge_cm = float(d_edge_cm + offset_x)
+        # else:
+            # msg_edge.d_edge_cm = -1.0
     #     msg_edge.edge_type = edge_type
     #     msg_edge.safety_level = safety_level
                 
@@ -575,9 +616,10 @@ class VisionDetectNode(Node):
     #         heading_msg.heading_error_rad = 0.0
     #     self.pub_heading_error.publish(heading_msg)
                 
-    #     # 4. 发布 Debug 图像
-    #     debug_msg = self.bridge.cv2_to_imgmsg(result_img, encoding="bgr8")
-    #     self.pub_debug.publish(debug_msg)
+    #     # 4. 发布 Debug 图像 (只在参数允许时发布)
+        # if self.enable_debug:
+        #     debug_msg = self.bridge.cv2_to_imgmsg(result_img, encoding="bgr8")
+        #     self.pub_debug.publish(debug_msg)
 
     def publish_localization(self):
         # ==========================================
