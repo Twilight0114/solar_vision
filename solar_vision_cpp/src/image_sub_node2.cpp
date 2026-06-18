@@ -12,12 +12,13 @@
 #include <tuple>
 #include <algorithm>
 #include <cmath>
-
-// 自定义消息头文件（请确保 CMakeLists.txt 和 package.xml 已正确配置依赖）
+#include "vision_detect_msgs/msg/vision_init.hpp"
+#include "vision_detect_msgs/msg/travel_context.hpp"
 #include "vision_detect_msgs/msg/vision_localization.hpp"
 #include "vision_detect_msgs/msg/heading_error.hpp"
 #include "vision_detect_msgs/msg/edge_observation.hpp"
 #include "vision_detect_msgs/msg/vision_status.hpp"
+//#include "rover_fcu_bridge/msg/rover_status.hpp"
 
 // 边缘信息结构体
 struct EdgeInfo {
@@ -98,11 +99,10 @@ public:
 
 private:
     // 回调函数
-    void video_loop_callback();
+    void video_loop_callback();//实机时注释掉
+    // void image_callback(const sensor_msgs::msg::Image::SharedPtr msg); // 预留给实机的回调
     void publish_localization();
     void cam_info_callback(const sensor_msgs::msg::CameraInfo::SharedPtr msg);
-    // void image_callback(const sensor_msgs::msg::Image::SharedPtr msg); // 预留给真实相机的回调
-
     // 参数变量
     double cam_offset_x_;
     double cam_offset_y_;
@@ -123,6 +123,8 @@ private:
 
     // 核心对象
     PVLineDetector line_detector_;
+
+    //实机时注释掉
     cv::VideoCapture cap_;
     std::string video_path_;
 
@@ -134,10 +136,20 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_debug_;
 
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_cam_info_;
-    // rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_image_;
+    // rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_image_;//实机使用
 
-    rclcpp::TimerBase::SharedPtr timer_video_;
+    rclcpp::TimerBase::SharedPtr timer_video_;//实机时注释掉
     rclcpp::TimerBase::SharedPtr timer_publish_loc_;
+
+    rclcpp::Subscription<vision_detect_msgs::msg::VisionInit>::SharedPtr sub_init_;
+    rclcpp::Subscription<vision_detect_msgs::msg::TravelContext>::SharedPtr sub_ctx_;
+    rclcpp::Subscription<rover_fcu_bridge::msg::RoverStatus>::SharedPtr sub_fcu_; // 飞控状态
+    // 2. 声明飞控车速变量
+    double current_fcu_speed_ = 0.0;
+    // 3. 声明看门狗相关的变量和函数
+    rclcpp::Time last_frame_time_;                     // 记录上一次收到图像的时间
+    rclcpp::TimerBase::SharedPtr timer_watchdog_;      // 看门狗定时器
+    void watchdog_check();                             // 看门狗检查函数
 };
 
 #endif  // VISION_DETECT_NODE_HPP_
@@ -486,7 +498,7 @@ VisionDetectNode::VisionDetectNode()
     vision_timeout_ = this->get_parameter("vision_timeout_ms").as_int();
     enable_debug_ = this->get_parameter("publish_debug_image").as_bool();
 
-    // 视频测试路径
+    // 视频测试路径，实机时注释掉
     video_path_ = "/home/cat/ros2_ws/testvideo/1.mp4";
     cap_.open(video_path_);
     if (!cap_.isOpened()) {
@@ -507,12 +519,52 @@ VisionDetectNode::VisionDetectNode()
     sub_cam_info_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
         info_topic, 10, std::bind(&VisionDetectNode::cam_info_callback, this, std::placeholders::_1));
 
-    // 定时器：30fps 视频流模拟 & 10Hz 定位发布
+    // 定时器：30fps 视频流模拟 & 10Hz 定位发布，实机时注释掉
     timer_video_ = this->create_wall_timer(
         std::chrono::milliseconds(33), std::bind(&VisionDetectNode::video_loop_callback, this));
     timer_publish_loc_ = this->create_wall_timer(
         std::chrono::milliseconds(100), std::bind(&VisionDetectNode::publish_localization, this));
+        
+    // --- 激活实机相机订阅 ---
+    std::string cam_topic = this->get_parameter("camera_topic").as_string();
+    sub_image_ = this->create_subscription<sensor_msgs::msg::Image>(
+        cam_topic, 10, std::bind(&VisionDetectNode::image_callback, this, std::placeholders::_1));
+        
+    RCLCPP_INFO(this->get_logger(), "视觉感知节点已就绪，正在监听真实的相机话题: %s", cam_topic.c_str());
+    // --- 激活订阅者和看门狗 ---
+    // 1. 订阅初始化指令 (使用 Lambda 匿名函数处理回调，[this] 表示允许访问类里的变量)
+    sub_init_ = this->create_subscription<vision_detect_msgs::msg::VisionInit>(
+        "/mission_planner/vision_init", 10, 
+        [this](const vision_detect_msgs::msg::VisionInit::SharedPtr msg) {
+            this->block_id_ = msg->block_id;
+            this->cell_row_ = msg->cell_row;
+            this->cell_col_ = msg->cell_col;
+            this->inner_row_ = msg->inner_row;
+            this->inner_col_ = msg->inner_col;
+            this->current_state_ = "NORMAL";
+            RCLCPP_INFO(this->get_logger(), "收到初始化: block=%d, inner=[%d, %d]", 
+                        this->block_id_, this->inner_row_, this->inner_col_);
+        });
 
+    // 2. 订阅清扫方向上下文
+    sub_ctx_ = this->create_subscription<vision_detect_msgs::msg::TravelContext>(
+        "/mission_planner/travel_context", 10, 
+        [this](const vision_detect_msgs::msg::TravelContext::SharedPtr msg) {
+            this->travel_axis_ = msg->travel_axis;
+            this->travel_sign_ = msg->travel_sign;
+        });
+
+    // 3. 订阅飞控状态 (如果你没编译飞控包，先把这段注释掉)
+    sub_fcu_ = this->create_subscription<rover_fcu_bridge::msg::RoverStatus>(
+        "/fcu/status", 10, 
+        [this](const rover_fcu_bridge::msg::RoverStatus::SharedPtr msg) {
+            this->current_fcu_speed_ = msg->linear_velocity_mps;
+        });
+
+    // 4. 激活看门狗定时器 (每 0.1 秒检查一次是否超时)
+    last_frame_time_ = this->get_clock()->now(); // 记录初始时间
+    timer_watchdog_ = this->create_wall_timer(
+        std::chrono::milliseconds(100), std::bind(&VisionDetectNode::watchdog_check, this));
     RCLCPP_INFO(this->get_logger(), "视觉感知节点 (C++版) 已启动，视频模式测试中...");
 }
 
@@ -523,6 +575,7 @@ void VisionDetectNode::cam_info_callback(const sensor_msgs::msg::CameraInfo::Sha
     line_detector_.cy = msg->k[5];
 }
 
+//实机时注释掉
 void VisionDetectNode::video_loop_callback() {
     if (!cap_.isOpened()) return;
 
@@ -536,6 +589,7 @@ void VisionDetectNode::video_loop_callback() {
     }
 
     try {
+        last_frame_time_ = this->get_clock()->now();
         ProcessResult res = line_detector_.process_frame(cv_image);
 
         // 1. 组装 EdgeObservation
@@ -583,12 +637,110 @@ void VisionDetectNode::video_loop_callback() {
 
         // 显示结果图像
         cv::imshow("Detected Lines & Yaw", res.output_img);
+        //---发布 Debug 图像 ---
+        if (enable_debug_) {
+            std_msgs::msg::Header header;
+            header.stamp = this->get_clock()->now();
+            header.frame_id = "camera_link"; 
+            // 将 OpenCV 的 cv::Mat 转换为 ROS 的 sensor_msgs/Image
+            sensor_msgs::msg::Image::SharedPtr msg_img = 
+                cv_bridge::CvImage(header, "bgr8", res.output_img).toImageMsg();
+            pub_debug_->publish(*msg_img);
+        }
         cv::waitKey(1);
 
     } catch (const std::exception& e) {
         RCLCPP_ERROR(this->get_logger(), "视频帧处理失败: %s", e.what());
     }
 }
+
+//实机时使用
+// void VisionDetectNode::image_callback(const sensor_msgs::msg::Image::SharedPtr msg) {
+//     // 1. 将 ROS 传来的压缩图像格式，转化为 OpenCV 认识的 cv::Mat 矩阵
+//     cv::Mat cv_image;
+//     try {
+//         cv_image = cv_bridge::toCvCopy(msg, "bgr8")->image;
+//     } catch (cv_bridge::Exception& e) {
+//         RCLCPP_ERROR(this->get_logger(), "致命错误：图像转换失败 (cv_bridge exception): %s", e.what());
+//         return;
+//     }
+
+//     if (cv_image.empty()) return;
+
+//     try {
+//         // 2. 喂狗：只要成功收到并解析了图像，就刷新看门狗时间戳
+//         last_frame_time_ = this->get_clock()->now();
+
+//         // 3. 把图像喂给底层算法大脑
+//         ProcessResult res = line_detector_.process_frame(cv_image);
+
+//         // ==========================================
+//         // 4. 组装并发布 EdgeObservation (边缘观测)
+//         // ==========================================
+//         vision_detect_msgs::msg::EdgeObservation msg_edge;
+//         msg_edge.edge_visible = res.edge_info.visible;
+//         msg_edge.edge_side = res.edge_info.visible ? res.edge_info.side : "";
+//         msg_edge.d_edge_cm = (res.edge_info.distance_cm >= 0) ? (res.edge_info.distance_cm + cam_offset_x_) : -1.0;
+//         msg_edge.edge_type = res.edge_info.type;
+//         msg_edge.safety_level = res.edge_info.safety_level;
+//         pub_edge_obs_->publish(msg_edge);
+
+//         // ==========================================
+//         // 5. 跨板与计步状态机逻辑
+//         // ==========================================
+//         if (current_state_ != "FAULT") {
+//             // 跨内部格子
+//             if (res.cross_event == 1) {
+//                 RCLCPP_INFO(this->get_logger(), ">>> 触发过线事件！(清扫方向: %d)", travel_sign_);
+//                 if (travel_axis_ == "block_u") inner_col_ += travel_sign_;
+//                 else inner_row_ += travel_sign_;
+//             }
+
+//             // 跨小板缝隙
+//             if (res.edge_info.visible && res.edge_info.type == PVLineDetector::EDGE_TYPE_CELL) {
+//                 RCLCPP_WARN(this->get_logger(), ">>> 跨越小板边界！");
+//                 if (travel_axis_ == "block_u") {
+//                     cell_col_ += travel_sign_;
+//                     inner_col_ = (travel_sign_ == 1) ? 0 : 99; // 重置内部网格
+//                 } else {
+//                     cell_row_ += travel_sign_;
+//                     inner_row_ = (travel_sign_ == 1) ? 0 : 99;
+//                 }
+//             }
+//         }
+
+//         // ==========================================
+//         // 6. 组装并发布 HeadingError (航向纠偏)
+//         // ==========================================
+//         vision_detect_msgs::msg::HeadingError heading_msg;
+//         heading_msg.header.stamp = this->get_clock()->now();
+//         heading_msg.header.frame_id = "body";
+        
+//         if (res.heading_error.has_value()) {
+//             heading_msg.valid = true;
+//             heading_msg.heading_error_rad = res.heading_error.value() * travel_sign_;
+//         } else {
+//             heading_msg.valid = false;
+//             heading_msg.heading_error_rad = 0.0;
+//         }
+//         pub_heading_error_->publish(heading_msg);
+
+//         // ==========================================
+//         // 7. 发布 Debug 调试图像 (仅在参数允许时)
+//         // ==========================================
+//         if (enable_debug_) {
+//             std_msgs::msg::Header header;
+//             header.stamp = this->get_clock()->now();
+//             header.frame_id = "camera_link"; 
+//             sensor_msgs::msg::Image::SharedPtr msg_img = 
+//                 cv_bridge::CvImage(header, "bgr8", res.output_img).toImageMsg();
+//             pub_debug_->publish(*msg_img);
+//         }
+
+//     } catch (const std::exception& e) {
+//         RCLCPP_ERROR(this->get_logger(), "相机视频帧处理崩溃: %s", e.what());
+//     }
+// }
 
 void VisionDetectNode::publish_localization() {
     vision_detect_msgs::msg::VisionLocalization msg;
@@ -607,7 +759,26 @@ void VisionDetectNode::publish_localization() {
     status_msg.camera_ok = cap_.isOpened();
     pub_status_->publish(status_msg);
 }
+// --- 看门狗检查逻辑 ---
+void VisionDetectNode::watchdog_check() {
+    auto now = this->get_clock()->now();
+    // 计算当前时间与上次收到图像时间的差值（秒）
+    double elapsed = (now - last_frame_time_).seconds();
+    double timeout_sec = vision_timeout_ / 1000.0; // 毫秒转秒
 
+    if (elapsed > timeout_sec) {
+        if (current_state_ != "FAULT") {
+            RCLCPP_ERROR(this->get_logger(), "严重警告：相机数据流超时 (%.2f 秒)！强制切入 FAULT 模式并发送紧急刹车。", elapsed);
+            current_state_ = "FAULT";
+            
+            // 发送悬崖报警，逼迫飞控停车
+            vision_detect_msgs::msg::EdgeObservation msg_edge;
+            msg_edge.edge_visible = true;
+            msg_edge.safety_level = "EDGE_FAULT";
+            pub_edge_obs_->publish(msg_edge);
+        }
+    }
+}
 // ==========================================
 // 节点主函数入口
 // ==========================================
